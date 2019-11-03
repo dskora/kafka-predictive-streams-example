@@ -1,0 +1,100 @@
+SET 'auto.offset.reset' = 'earliest';
+SET 'windowstore.changelog.additional.retention.ms'='11110000000000';
+
+-- Create moodle debezium streams
+CREATE STREAM moodle_logs_dbz WITH (KAFKA_TOPIC='demo.demo.mdl_logstore_standard_log', VALUE_FORMAT='AVRO');
+CREATE STREAM moodle_logs WITH (PARTITIONS=1) AS SELECT * FROM moodle_logs_dbz PARTITION BY userid;
+CREATE STREAM moodle_users_dbz WITH (KAFKA_TOPIC='demo.demo.mdl_user', VALUE_FORMAT='AVRO');
+CREATE STREAM moodle_users_rekeyed WITH (PARTITIONS=1) AS SELECT * FROM moodle_users_dbz PARTITION BY userid;
+
+SELECT * FROM moodle_users_rekeyed LIMIT 1;
+CREATE TABLE moodle_users WITH (KAFKA_TOPIC='MOODLE_USERS_REKEYED', VALUE_FORMAT='AVRO', KEY='USERID');
+
+CREATE STREAM moodle_logs_with_stu WITH (PARTITIONS=1) AS
+    SELECT l.eventname, l.userid, l.timecreated, u.username AS stunumber FROM moodle_logs l JOIN moodle_users u ON u.ROWKEY = l.ROWKEY
+    PARTITION BY stunumber
+;
+
+-- Create system debezium streams
+CREATE TABLE courses WITH (KAFKA_TOPIC='demo.demo.courses', VALUE_FORMAT='AVRO', KEY='id');
+
+CREATE STREAM intakes_dbz WITH (KAFKA_TOPIC='demo.demo.intakes', VALUE_FORMAT='AVRO');
+CREATE STREAM intakes_rekeyed WITH (PARTITIONS=1) AS SELECT * FROM intakes_dbz PARTITION BY id;
+-- Wait for rekeyed
+SELECT * FROM intakes_rekeyed LIMIT 1;
+CREATE TABLE intakes WITH (KAFKA_TOPIC='INTAKES_REKEYED', VALUE_FORMAT='AVRO', KEY='ID');
+
+CREATE STREAM student_courses_dbz WITH (KAFKA_TOPIC='demo.demo.student_courses', VALUE_FORMAT='AVRO');
+CREATE STREAM student_courses_rekeyed WITH (PARTITIONS=1) AS SELECT * FROM student_courses_dbz PARTITION BY id;
+-- Wait for rekeyed
+SELECT * FROM student_courses_rekeyed LIMIT 1;
+CREATE STREAM student_courses WITH (KAFKA_TOPIC='STUDENT_COURSES_REKEYED', VALUE_FORMAT='AVRO', KEY='STUDENT_ID');
+
+-- CREATE STREAM student_course_withdrawals_dbz WITH (KAFKA_TOPIC='demo.demo.student_course_withdrawals', VALUE_FORMAT='AVRO');
+-- CREATE STREAM student_course_withdrawals_rekeyed WITH (PARTITIONS=1) AS SELECT * FROM student_course_withdrawals_dbz PARTITION BY student_course_id;
+-- Wait for rekeyed
+-- SELECT * FROM student_course_withdrawals_rekeyed LIMIT 1;
+-- CREATE TABLE student_courses_withdrawals WITH (KAFKA_TOPIC='STUDENT_COURSE_WITHDRAWALS_REKEYED',VALUE_FORMAT='AVRO',KEY='STUDENT_COURSE_ID');
+
+-- Wait for topic
+CREATE STREAM student_courses_with_intake_name WITH (PARTITIONS=1) AS
+    SELECT sc.id AS id, sc.stunumber, sc.student_id AS student_id, sc.status AS status, i.name AS intake_name FROM student_courses_rekeyed sc JOIN intakes i ON i.id = sc.intake_id
+    PARTITION BY stunumber
+;
+
+SELECT * FROM student_courses_with_intake_name LIMIT 1;
+CREATE TABLE student_courses_with_intake_name_t WITH (KAFKA_TOPIC='STUDENT_COURSES_WITH_INTAKE_NAME',VALUE_FORMAT='AVRO',KEY='STUDENT_ID');
+
+CREATE STREAM moodle_logs_enriched WITH (TIMESTAMP='timecreated', PARTITIONS=1) AS
+    SELECT sc.student_id AS student_id, sc.stunumber AS stunumber, sc.status AS status, sc.intake_name AS intake_name, l.timecreated AS timecreated FROM moodle_logs_with_stu l JOIN student_courses_with_intake_name_t sc ON l.ROWKEY = sc.ROWKEY
+;
+-- Create sessions and aggregates
+CREATE TABLE moodle_logs_sessions_per_15mins WITH (VALUE_FORMAT='JSON', PARTITIONS=1) AS
+    SELECT stunumber, intake_name, status, WindowStart() AS start_date, WindowEnd() AS end_date, COUNT(*) AS activities, ((WindowEnd() - WindowStart())/1000)+1 AS duration FROM moodle_logs_enriched WINDOW SESSION (15 minutes) GROUP BY stunumber, status, intake_name
+;
+SELECT * FROM moodle_logs_sessions_per_15mins LIMIT 1;
+CREATE TABLE sessions_agg_per_date WITH (PARTITIONS=1) AS
+    SELECT TIMESTAMPTOSTRING(start_date,'yyyy-MM-dd') AS date, COUNT(*) AS count, SUM(duration)/COUNT(*) AS avg_duration, SUM(activities)/COUNT(*) AS avg_activities FROM moodle_logs_sessions_per_15mins GROUP BY TIMESTAMPTOSTRING(start_date,'yyyy-MM-dd')
+;
+CREATE TABLE sessions_agg_per_date_rekeyed(date STRING, count INT, avg_duration DOUBLE, avg_activities DOUBLE) WITH (KAFKA_TOPIC='SESSIONS_AGG_PER_DATE',VALUE_FORMAT='JSON',KEY='DATE');
+CREATE TABLE sessions_agg_per_date_student WITH (PARTITIONS=1) AS
+    SELECT TIMESTAMPTOSTRING(start_date,'yyyy-MM-dd') AS date, stunumber, status, COUNT(*) AS count, SUM(duration)/COUNT(*) AS avg_duration, SUM(activities)/COUNT(*) AS avg_activities FROM moodle_logs_sessions_per_15mins GROUP BY TIMESTAMPTOSTRING(start_date,'yyyy-MM-dd'), stunumber, status
+;
+CREATE STREAM sessions_agg_per_date_student_s(date STRING, stunumber STRING, status STRING, count DOUBLE, avg_duration DOUBLE, avg_activities DOUBLE) WITH (KAFKA_TOPIC='SESSIONS_AGG_PER_DATE_STUDENT', VALUE_FORMAT='JSON');
+CREATE STREAM sessions_agg_per_date_student_rekeyed_student WITH (PARTITIONS=1) AS SELECT * FROM sessions_agg_per_date_student_s PARTITION BY date;
+-- Wait for rekeyed
+SELECT * FROM sessions_agg_per_date_student_rekeyed_student LIMIT 1;
+CREATE STREAM sessions_agg_per_date_with_all WITH (PARTITIONS=1) AS
+    SELECT
+        ss.date AS date,
+        ss.stunumber AS stunumber,
+        ss.status AS status,
+        ss.count AS student_session_count,
+        ss.avg_duration AS student_session_avg_duration,
+        ss.avg_activities AS student_session_avg_activities,
+        sd.count AS session_count,
+        sd.avg_duration AS session_avg_duration,
+        sd.avg_activities AS session_avg_activities
+        FROM sessions_agg_per_date_student_rekeyed_student ss JOIN sessions_agg_per_date_rekeyed sd ON ss.ROWKEY = sd.ROWKEY
+;
+CREATE TABLE sessions_agg_distinct_students_per_date WITH(PARTITIONS=1) AS SELECT date, count(*) AS count FROM sessions_agg_per_date_student GROUP BY date;
+SELECT * FROM sessions_agg_distinct_students_per_date LIMIT 1;
+CREATE STREAM sessions_ratio_per_date_student WITH (PARTITIONS=1) AS
+    SELECT
+        sa.date AS date,
+        sa.stunumber AS stunumber,
+        sa.status AS status,
+        sa.student_session_count/(CAST(sa.session_count AS DOUBLE)/CAST(sd.count AS DOUBLE)) AS count,
+        sa.student_session_avg_duration/sa.session_avg_duration AS avg_duration,
+        sa.student_session_avg_activities/session_avg_activities AS avg_activities
+    FROM sessions_agg_per_date_with_all sa JOIN sessions_agg_distinct_students_per_date sd ON sd.ROWKEY = sa.ROWKEY
+;
+CREATE TABLE sessions_ratio_per_student WITH (PARTITIONS=1) AS
+    SELECT stunumber, status, SUM(count)/COUNT(*) AS count, SUM(avg_duration)/COUNT(*) AS avg_duration, SUM(avg_activities)/COUNT(*) AS avg_activities FROM sessions_ratio_per_date_student GROUP BY stunumber, status
+;
+CREATE STREAM sessions_ratio_per_student_s (stunumber STRING, status STRING, count DOUBLE, avg_duration DOUBLE, avg_activities DOUBLE) WITH (VALUE_FORMAT='JSON', KAFKA_TOPIC='SESSIONS_RATIO_PER_STUDENT');
+CREATE STREAM sessions_ratio_per_student_avro WITH (PARTITIONS=1, VALUE_FORMAT='AVRO', KAFKA_TOPIC='SESSIONS_RATIO_PER_STUDENT_AVRO') AS SELECT * FROM sessions_ratio_per_student_s;
+
+-- CREATE TABLE moodle_logs_prediction_agg WITH (VALUE_FORMAT='JSON', PARTITIONS=1) AS SELECT userid, sum(activities) AS activities, sum(duration)/count(*) AS duration, count(*) AS sessions FROM moodle_logs_sessions_per_15mins GROUP BY userid;
+-- CREATE STREAM moodle_logs_prediction(userid bigint, prediction double, created_date bigint) WITH (KAFKA_TOPIC='MOODLE_LOGS_PREDICTION', VALUE_FORMAT='JSON', TIMESTAMP='created_date');
+-- CREATE STREAM moodle_logs_prediction_in_risk WITH (VALUE_FORMAT='JSON', PARTITIONS=1) AS SELECT * FROM moodle_logs_prediction WHERE prediction > 0.7;
